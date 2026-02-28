@@ -12,23 +12,9 @@ set -e
 
 CODESPACE_NAME=""  # Leave empty to auto-detect
 
-# ─── Helper to resolve workspace dir inside the codespace ────────────────
-# Codespaces use /workspaces/<repo-name>, not /workspace
-# setup.sh saves the path to ~/.sandbox-workdir
-RESOLVE_WORKDIR='
-WORKDIR="";
-if [ -f "$HOME/.sandbox-workdir" ]; then
-    WORKDIR="$(cat "$HOME/.sandbox-workdir")";
-else
-    WORKDIR="$(find /workspaces -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)";
-fi;
-if [ -z "$WORKDIR" ] || [ ! -d "$WORKDIR" ]; then
-    echo "❌ Could not find workspace directory." >&2;
-    echo "   Is the codespace set up? Try: gh codespace ssh" >&2;
-    exit 1;
-fi;
-cd "$WORKDIR"
-'
+# Remote commands use ~/run-in-workspace.sh to cd to the correct directory
+# (installed by .devcontainer/setup.sh)
+RW="\$HOME/run-in-workspace.sh"
 
 # ─── Colours ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -99,10 +85,10 @@ do_auth() {
     read -rp "Press Enter to continue..." _
 
     # SSH in, resolve the workdir, then launch claude
-    gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; claude"
+    gh codespace ssh -c "$cs" -- "$RW" claude
 
     # Trigger credential backup
-    gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; bash .devcontainer/save-creds.sh" 2>/dev/null || true
+    gh codespace ssh -c "$cs" -- "$RW" bash .devcontainer/save-creds.sh 2>/dev/null || true
 
     echo ""
     ok "Authentication complete! Credentials saved."
@@ -159,9 +145,9 @@ submit_task() {
     local escaped_task="${task//\'/\'\\\'\'}"
 
     if [ "$wait_flag" = "--wait" ]; then
-        gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; bash task-runner.sh '$escaped_task'"
+        gh codespace ssh -c "$cs" -- "$RW" bash task-runner.sh "$escaped_task"
     else
-        gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; nohup bash task-runner.sh '$escaped_task' > /dev/null 2>&1 &"
+        gh codespace ssh -c "$cs" -- "$RW" bash -c "nohup bash task-runner.sh '$escaped_task' > /dev/null 2>&1 &"
         ok "Task submitted in background."
         info "Check results with: $0 --list-results"
     fi
@@ -176,18 +162,17 @@ list_results() {
     info "Results from codespace: $cs"
     echo ""
 
-    gh codespace ssh -c "$cs" -- bash -c "
-        $RESOLVE_WORKDIR
-        for dir in \"\$WORKDIR\"/results/task-*/; do
-            [ -d \"\$dir\" ] || continue
-            meta=\"\$dir/task-meta.json\"
-            if [ -f \"\$meta\" ]; then
-                echo \"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\"
-                jq -r '\"📋 \(.task_id) [\(.status)]\" + \"\n   Task: \(.task)\" + \"\n   Duration: \(.duration_seconds // \"running\")s\"' \"\$meta\" 2>/dev/null
+    gh codespace ssh -c "$cs" -- "$RW" bash -c '
+        for dir in results/task-*/; do
+            [ -d "$dir" ] || continue
+            meta="$dir/task-meta.json"
+            if [ -f "$meta" ]; then
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                jq -r "\"📋 \(.task_id) [\(.status)]\n   Task: \(.task)\n   Duration: \(.duration_seconds // \"running\")s\"" "$meta" 2>/dev/null
             fi
         done
-        echo \"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\"
-    "
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    '
 }
 
 # ─── Fetch specific result ───────────────────────────────────────────────
@@ -199,7 +184,7 @@ fetch_result() {
 
     info "Fetching result for: $task_id"
     echo ""
-    gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; cat results/$task_id/response.txt 2>/dev/null || echo 'Result not found'"
+    gh codespace ssh -c "$cs" -- "$RW" cat "results/$task_id/response.txt"
 }
 
 # ─── Interactive ─────────────────────────────────────────────────────────
@@ -209,7 +194,7 @@ open_interactive() {
     [ -z "$cs" ] && { err "No codespace available"; exit 1; }
 
     info "Opening interactive Claude Code session..."
-    gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; claude"
+    gh codespace ssh -c "$cs" -- "$RW" claude
 }
 
 # ─── Pull results ───────────────────────────────────────────────────────
