@@ -14,7 +14,7 @@ CODESPACE_NAME=""  # Leave empty to auto-detect
 
 # Remote commands use ~/run-in-workspace.sh to cd to the correct directory
 # (installed by .devcontainer/setup.sh)
-RW="\$HOME/run-in-workspace.sh"
+RW="run-in-workspace.sh"
 
 # ─── Colours ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'

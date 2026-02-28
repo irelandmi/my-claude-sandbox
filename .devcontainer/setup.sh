@@ -66,9 +66,9 @@ You are running in an isolated GitHub Codespace sandbox.
 - ./logs     — execution logs
 CLAUDEMD
 
-# Install workspace wrapper to home dir (used by SSH commands)
-cp "$WORKDIR/.devcontainer/run-in-workspace.sh" "$HOME/run-in-workspace.sh"
-chmod +x "$HOME/run-in-workspace.sh"
+# Install workspace wrapper to a fixed path (used by SSH commands)
+sudo cp "$WORKDIR/.devcontainer/run-in-workspace.sh" /usr/local/bin/run-in-workspace.sh
+sudo chmod +x /usr/local/bin/run-in-workspace.sh
 
 # Make scripts executable
 chmod +x "$WORKDIR/task-runner.sh" 2>/dev/null || true
