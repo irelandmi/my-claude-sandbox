@@ -1,43 +1,41 @@
 #!/bin/bash
-# batch-submit.sh — Submit multiple tasks from a file
-# Usage: ./batch-submit.sh tasks.txt [parallelism]
+# batch-submit.sh — Submit multiple tasks from a file via the HTTP API
+# Usage: ./batch-submit.sh tasks.txt
 set -e
 
+API="http://localhost:7680"
 TASKS_FILE="${1:-tasks.txt}"
-PARALLEL="${2:-1}"
 
 if [ ! -f "$TASKS_FILE" ]; then
     echo "❌ Tasks file not found: $TASKS_FILE"
+    echo "Usage: $0 <tasks-file>"
     echo ""
-    echo "Usage: $0 <tasks-file> [parallelism]"
-    echo ""
-    echo "Create a tasks.txt with one task per line:"
-    echo "  Write unit tests for auth.py"
-    echo "  Refactor the database module"
-    echo "  Create a README"
+    echo "One task per line, lines starting with # are skipped."
+    exit 1
+fi
+
+if ! curl -s --max-time 3 "$API/health" > /dev/null 2>&1; then
+    echo "❌ API not reachable. Run: gh codespace ports forward 7680:7680"
     exit 1
 fi
 
 TOTAL=$(grep -c '[^[:space:]]' "$TASKS_FILE" || echo 0)
-echo "📋 Submitting $TOTAL tasks (parallelism: $PARALLEL)"
+echo "📋 Submitting $TOTAL tasks..."
 echo ""
 
 CURRENT=0
 while IFS= read -r task; do
     [[ -z "$task" || "$task" =~ ^# ]] && continue
     CURRENT=$((CURRENT + 1))
-    echo "[$CURRENT/$TOTAL] Submitting: $task"
 
-    if [ "$PARALLEL" -gt 1 ]; then
-        ./submit-task.sh "$task" &
-        if (( CURRENT % PARALLEL == 0 )); then wait; fi
-    else
-        ./submit-task.sh "$task" --wait
-    fi
-    echo ""
+    result=$(curl -s -X POST "$API/tasks" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg t "$task" '{task: $t}')")
+
+    task_id=$(echo "$result" | jq -r '.task_id')
+    echo "[$CURRENT/$TOTAL] $task_id — $task"
 done < "$TASKS_FILE"
 
-wait
 echo ""
 echo "✅ All $TOTAL tasks submitted!"
-echo "Check results: ./submit-task.sh --list-results"
+echo "Check progress: ./submit-task.sh --list"

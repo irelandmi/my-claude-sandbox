@@ -1,6 +1,23 @@
-# Claude Code Sandbox — Max Plan + GitHub Codespaces
+# Claude Code Sandbox — Max Plan + HTTP API
 
-Run Claude Code tasks in an isolated GitHub Codespace using your Max plan subscription. No API key needed — authenticate once with OAuth and credentials persist across rebuilds.
+Run Claude Code tasks in an isolated GitHub Codespace. No SSH — a lightweight Express API runs inside the codespace and you submit tasks via `curl` over a forwarded port.
+
+## Architecture
+
+```
+┌──────────────────┐    port forward (7680)    ┌──────────────────────────┐
+│   Your Machine   │ ◀══════════════════════▶  │   GitHub Codespace       │
+│                  │                           │                          │
+│  submit-task.sh  │──── POST /tasks ────────▶ │  Express API (server.js) │
+│  (uses curl)     │                           │         │                │
+│                  │◀─── JSON response ─────── │         ▼                │
+│                  │                           │  Claude Code (headless)  │
+│                  │                           │         │                │
+│                  │                           │    results/ + logs/      │
+│                  │                           │                          │
+│                  │                           │  🔒 Codespace isolation  │
+└──────────────────┘                           └──────────────────────────┘
+```
 
 ## Quick Start
 
@@ -8,67 +25,80 @@ Run Claude Code tasks in an isolated GitHub Codespace using your Max plan subscr
 
 ```bash
 gh repo create my-claude-sandbox --public --clone
-# copy these files into the repo
-git add -A && git commit -m "Initial sandbox setup" && git push
+# copy files in
+git add -A && git commit -m "Initial setup" && git push
 ```
 
 ### 2. Create the Codespace
 
 ```bash
-gh codespace create --repo yourname/my-claude-sandbox --machine basicLinux32gb
+gh codespace create --repo you/my-claude-sandbox --machine basicLinux32gb
 ```
 
-Wait ~1 minute for post-create setup to install Claude Code.
-
-### 3. Authenticate with your Max plan (one time)
+### 3. Authenticate with Max plan (one time)
 
 ```bash
 ./submit-task.sh --auth
 ```
 
-This SSHs into the codespace and launches Claude Code interactively. Select **"Claude account with subscription"**, follow the OAuth link, and paste the code back. Credentials are saved to a persistent Docker volume and restored automatically on rebuilds.
+This opens the codespace in your browser. In the VS Code terminal, run `claude`, authenticate, then exit.
 
-### 4. Submit tasks
+### 4. Forward the port
 
 ```bash
-./submit-task.sh "Write a Python web scraper for HN" --wait
-./submit-task.sh "Create a FastAPI REST API"
-./submit-task.sh --list-results
-./submit-task.sh --fetch task-20250228-143022-1234
-./submit-task.sh --pull
-./submit-task.sh --interactive
+gh codespace ports forward 7680:7680 &
 ```
 
-## How It Works
+### 5. Check it's working
 
-All SSH commands resolve the workspace path dynamically via `~/.sandbox-workdir` (written by `setup.sh`). GitHub Codespaces place repos at `/workspaces/<repo-name>` — the scripts handle this automatically.
+```bash
+./submit-task.sh --health
+```
 
-Auth credentials are stored in a persistent Docker volume mounted at `~/.claude-persist/`. On each codespace rebuild, `setup.sh` restores them so you don't have to re-login.
+### 6. Submit tasks
 
-## Files
+```bash
+# Async
+./submit-task.sh "Write a Python fibonacci function with tests"
 
-| File | Purpose |
-|---|---|
-| `.devcontainer/devcontainer.json` | Container config + persistent volume |
-| `.devcontainer/Dockerfile` | Base image |
-| `.devcontainer/setup.sh` | Installs Claude Code, restores credentials, saves workspace path |
-| `.devcontainer/save-creds.sh` | Backs up OAuth tokens on every attach |
-| `.devcontainer/init-firewall.sh` | Network allowlist firewall |
-| `task-runner.sh` | Runs tasks headless inside the codespace |
-| `submit-task.sh` | Local CLI for auth, task submission, results |
-| `batch-submit.sh` | Batch task submission from file |
+# Wait for result
+./submit-task.sh "Create a FastAPI REST API" --wait
 
-## Troubleshooting
+# Use a specific model
+./submit-task.sh "Review this codebase" claude-opus-4-6
 
-**"Could not find workspace directory"**: The codespace may not have finished setup. Wait a moment and retry, or SSH in directly with `gh codespace ssh`.
+# List all tasks
+./submit-task.sh --list
 
-**Re-authentication needed**: Run `./submit-task.sh --auth` again. If credentials aren't persisting, check that the Docker volume mounted correctly with `./submit-task.sh --check`.
+# Get a specific result
+./submit-task.sh --get task-1709012345678-a1b2c3
+```
 
-**Firewall issues**: The firewall only runs if setup runs as root. In Codespaces it typically runs as `vscode`, so the firewall may be skipped. This is fine — Codespaces are already isolated.
+### 7. Batch tasks
+
+```bash
+cat > tasks.txt << EOF
+Write unit tests for the API endpoints
+Create a comprehensive README
+Add input validation to all form handlers
+EOF
+
+./batch-submit.sh tasks.txt
+```
+
+## API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/tasks` | Submit a task `{"task": "...", "model": "..."}` |
+| `GET` | `/tasks` | List all tasks |
+| `GET` | `/tasks/:id` | Get task result |
+| `GET` | `/tasks/:id/files` | List files in task result dir |
+| `GET` | `/health` | Health + auth status |
 
 ## Cleanup
 
 ```bash
-gh codespace stop     # pause (stops billing, keeps state)
-gh codespace delete   # destroy entirely
+gh codespace stop     # pause
+gh codespace delete   # destroy
 ```

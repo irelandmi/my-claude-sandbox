@@ -1,8 +1,15 @@
 #!/bin/bash
-# submit-task.sh — Submit tasks to Claude Code in a GitHub Codespace (Max Plan)
+# submit-task.sh — Submit tasks to Claude Code via HTTP API (no SSH needed)
+#
+# Setup:
+#   1. Create codespace: gh codespace create --repo you/my-sandbox
+#   2. First-time auth: gh codespace code --web (then run 'claude' in terminal)
+#   3. Forward port:    gh codespace ports forward 7680:7680
+#   4. Submit tasks:    ./submit-task.sh 'your task here'
+
 set -e
 
-CODESPACE_NAME=""  # Leave empty to auto-detect
+API="http://localhost:7680"
 
 # ─── Colours ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -14,219 +21,211 @@ warn()  { echo -e "${YELLOW}⚠️  $*${NC}"; }
 err()   { echo -e "${RED}❌ $*${NC}" >&2; }
 header(){ echo -e "${CYAN}$*${NC}"; }
 
-# ─── Find a running codespace ───────────────────────────────────────────
-get_codespace() {
-    if [ -n "$CODESPACE_NAME" ]; then
-        echo "$CODESPACE_NAME"
-        return
-    fi
-
-    local cs
-    cs=$(gh codespace list --json name,state,repository \
-        -q '.[] | select(.state=="Available") | .name' | head -1)
-
-    if [ -z "$cs" ]; then
-        warn "No running codespace found."
+# ─── Check API is reachable ──────────────────────────────────────────────
+check_api() {
+    if ! curl -s --max-time 3 "$API/health" > /dev/null 2>&1; then
+        err "Can't reach the task API at $API"
         echo ""
-        info "Your codespaces:"
-        gh codespace list
+        echo "  Make sure you're forwarding the port:"
+        echo "    gh codespace ports forward 7680:7680"
         echo ""
-        read -rp "Enter codespace name (or 'new' to create one): " cs
-
-        if [ "$cs" = "new" ]; then
-            read -rp "Repository (owner/repo): " REPO
-            info "Creating codespace for $REPO..."
-            cs=$(gh codespace create --repo "$REPO" --machine basicLinux32gb \
-                --devcontainer-path .devcontainer/devcontainer.json \
-                --json -q '.name')
-            ok "Created codespace: $cs"
-            info "Waiting for setup to complete..."
-            sleep 30
-        fi
+        echo "  Or run it in the background:"
+        echo "    gh codespace ports forward 7680:7680 &"
+        echo ""
+        exit 1
     fi
-
-    echo "$cs"
 }
 
-# ─── Resolve the remote workspace path ──────────────────────────────────
-# Calls SSH once to find the path, caches it for the session
-CACHED_WORKDIR=""
-get_workdir() {
-    local cs="$1"
-    if [ -z "$CACHED_WORKDIR" ]; then
-        CACHED_WORKDIR=$(gh codespace ssh -c "$cs" -- \
-            'cat $HOME/.sandbox-workdir 2>/dev/null || find /workspaces -maxdepth 1 -mindepth 1 -type d | head -1')
-        CACHED_WORKDIR=$(echo "$CACHED_WORKDIR" | tr -d '\r\n')
-    fi
-    echo "$CACHED_WORKDIR"
-}
-
-# ─── Auth ────────────────────────────────────────────────────────────────
-do_auth() {
-    local cs
-    cs=$(get_codespace)
-    [ -z "$cs" ] && { err "No codespace available"; exit 1; }
-
-    local wd
-    wd=$(get_workdir "$cs")
-
-    header ""
-    header "════════════════════════════════════════════════════════"
-    header "  🔐 Max Plan Authentication"
-    header "════════════════════════════════════════════════════════"
+# ─── Health check ────────────────────────────────────────────────────────
+do_health() {
+    check_api
+    local result
+    result=$(curl -s "$API/health")
     echo ""
-    info "Opening an interactive SSH session to your codespace."
-    info "Claude Code will start and prompt you to authenticate."
+    header "Claude Code Sandbox Status"
     echo ""
-    echo "  1. Select 'Claude account with subscription'"
-    echo "  2. A login URL will appear — open it in your browser"
-    echo "  3. Authorise the app"
-    echo "  4. Copy the auth code and paste it back in the terminal"
-    echo "  5. Once authenticated, type /exit or Ctrl+C to close"
-    echo ""
-    info "Your credentials will persist across codespace rebuilds."
-    echo ""
-    read -rp "Press Enter to continue..." _
-
-    gh codespace ssh -c "$cs" -- "cd $wd && claude"
-
-    # Trigger credential backup
-    gh codespace ssh -c "$cs" -- "cd $wd && bash .devcontainer/save-creds.sh" 2>/dev/null || true
-
-    echo ""
-    ok "Authentication complete! Credentials saved."
-    info "You can now submit tasks with: $0 'your task description'"
-}
-
-# ─── Check auth ──────────────────────────────────────────────────────────
-check_auth() {
-    local cs
-    cs=$(get_codespace)
-    [ -z "$cs" ] && { err "No codespace available"; exit 1; }
-
-    info "Checking authentication status..."
-
-    gh codespace ssh -c "$cs" -- bash -c '
-        echo ""
-        if [ -f "$HOME/.claude/.credentials.json" ]; then
-            echo "✅ OAuth credentials found at ~/.claude/.credentials.json"
-        else
-            echo "❌ No credentials at ~/.claude/.credentials.json"
-        fi
-        if [ -f "$HOME/.claude-persist/.credentials.json" ]; then
-            echo "✅ Persistent backup exists (survives rebuilds)"
-        else
-            echo "⚠️  No persistent backup yet"
-        fi
-        if [ -f "$HOME/.config/claude-code/auth.json" ]; then
-            echo "✅ Auth token at ~/.config/claude-code/auth.json"
-        fi
-        if [ -f "$HOME/.sandbox-workdir" ]; then
-            echo "📁 Workspace: $(cat $HOME/.sandbox-workdir)"
-        else
-            echo "⚠️  Workspace path not saved (setup may not have completed)"
-        fi
-        echo ""
+    echo "$result" | jq -r '
+        "  Status:         \(.status)",
+        "  Claude Version:  \(.claude_version)",
+        "  Authenticated:   \(.authenticated)",
+        "  Workspace:       \(.workspace)",
+        "  Running Tasks:   \(.running_tasks)"
     '
+    echo ""
 }
 
 # ─── Submit task ─────────────────────────────────────────────────────────
 submit_task() {
     local task="$1"
-    local wait_flag="$2"
-    local cs
+    local model="$2"
+    local wait_flag="$3"
 
-    cs=$(get_codespace)
-    [ -z "$cs" ] && { err "No codespace available"; exit 1; }
+    check_api
 
-    local wd
-    wd=$(get_workdir "$cs")
+    local body
+    if [ -n "$model" ] && [ "$model" != "--wait" ]; then
+        body=$(jq -n --arg t "$task" --arg m "$model" '{task: $t, model: $m}')
+    else
+        body=$(jq -n --arg t "$task" '{task: $t}')
+        # If second arg was --wait, shift it
+        if [ "$model" = "--wait" ]; then
+            wait_flag="--wait"
+        fi
+    fi
 
-    info "Submitting task to codespace: $cs"
+    info "Submitting task..."
+    echo "📋 $task"
     echo ""
-    echo "📋 Task: $task"
-    echo ""
 
-    local escaped_task="${task//\'/\'\\\'\'}"
+    local result
+    result=$(curl -s -X POST "$API/tasks" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+
+    local task_id
+    task_id=$(echo "$result" | jq -r '.task_id')
+
+    if [ "$task_id" = "null" ] || [ -z "$task_id" ]; then
+        err "Failed to submit task"
+        echo "$result" | jq .
+        exit 1
+    fi
+
+    ok "Submitted: $task_id"
 
     if [ "$wait_flag" = "--wait" ]; then
-        gh codespace ssh -c "$cs" -- "cd $wd && bash task-runner.sh '$escaped_task'"
+        echo ""
+        info "Waiting for completion..."
+
+        while true; do
+            sleep 3
+            local status
+            status=$(curl -s "$API/tasks/$task_id" | jq -r '.status')
+
+            if [ "$status" = "completed" ] || [ "$status" = "failed" ]; then
+                echo ""
+                local full
+                full=$(curl -s "$API/tasks/$task_id")
+
+                local duration
+                duration=$(echo "$full" | jq -r '.duration_seconds')
+                echo "$full" | jq -r '.status' | xargs -I{} echo "  Status:   {}"
+                echo "  Duration: ${duration}s"
+                echo ""
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "$full" | jq -r '.response // "No response"' | head -40
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                break
+            fi
+
+            printf "."
+        done
     else
-        gh codespace ssh -c "$cs" -- "cd $wd && nohup bash task-runner.sh '$escaped_task' > /dev/null 2>&1 &"
-        ok "Task submitted in background."
-        info "Check results with: $0 --list-results"
+        info "Running in background. Check with: $0 --get $task_id"
     fi
 }
 
-# ─── List results ────────────────────────────────────────────────────────
-list_results() {
-    local cs
-    cs=$(get_codespace)
-    [ -z "$cs" ] && { err "No codespace available"; exit 1; }
+# ─── List tasks ──────────────────────────────────────────────────────────
+list_tasks() {
+    check_api
 
-    local wd
-    wd=$(get_workdir "$cs")
+    local result
+    result=$(curl -s "$API/tasks")
 
-    info "Results from codespace: $cs"
+    local count
+    count=$(echo "$result" | jq -r '.count')
+
+    header "Tasks ($count)"
     echo ""
 
-    gh codespace ssh -c "$cs" -- bash -c "
-        cd $wd
-        for dir in results/task-*/; do
-            [ -d \"\$dir\" ] || continue
-            meta=\"\$dir/task-meta.json\"
-            if [ -f \"\$meta\" ]; then
-                echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
-                jq -r '\"📋 \" + .task_id + \" [\" + .status + \"]\" + \"\n   Task: \" + .task + \"\n   Duration: \" + (.duration_seconds // \"running\" | tostring) + \"s\"' \"\$meta\" 2>/dev/null
-            fi
-        done
-        echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
-    "
+    echo "$result" | jq -r '.tasks[] |
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "📋 \(.task_id)  [\(.status)]",
+        "   \(.task)",
+        "   Duration: \(.duration_seconds // "running")s",
+        ""'
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
-# ─── Fetch specific result ───────────────────────────────────────────────
-fetch_result() {
+# ─── Get task result ─────────────────────────────────────────────────────
+get_task() {
     local task_id="$1"
-    local cs
-    cs=$(get_codespace)
-    [ -z "$cs" ] && { err "No codespace available"; exit 1; }
+    check_api
 
-    local wd
-    wd=$(get_workdir "$cs")
+    if [ -z "$task_id" ]; then
+        err "Usage: $0 --get <task-id>"
+        exit 1
+    fi
 
-    info "Fetching result for: $task_id"
+    local result
+    result=$(curl -s "$API/tasks/$task_id")
+
+    local status
+    status=$(echo "$result" | jq -r '.status')
+
+    if [ "$status" = "null" ]; then
+        err "Task not found: $task_id"
+        exit 1
+    fi
+
+    header "Task: $task_id [$status]"
     echo ""
-    gh codespace ssh -c "$cs" -- "cat $wd/results/$task_id/response.txt 2>/dev/null || echo 'Result not found'"
+
+    echo "$result" | jq -r '
+        "  Task:     \(.task)",
+        "  Model:    \(.model)",
+        "  Status:   \(.status)",
+        "  Duration: \(.duration_seconds // "running")s",
+        ""'
+
+    if [ "$status" = "completed" ] || [ "$status" = "failed" ]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "$result" | jq -r '.response // "No response"'
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
 }
 
-# ─── Interactive ─────────────────────────────────────────────────────────
-open_interactive() {
-    local cs
-    cs=$(get_codespace)
-    [ -z "$cs" ] && { err "No codespace available"; exit 1; }
-
-    local wd
-    wd=$(get_workdir "$cs")
-
-    info "Opening interactive Claude Code session..."
-    gh codespace ssh -c "$cs" -- "cd $wd && claude"
+# ─── Forward port (convenience) ──────────────────────────────────────────
+do_forward() {
+    info "Forwarding port 7680 from codespace..."
+    info "Press Ctrl+C to stop"
+    gh codespace ports forward 7680:7680
 }
 
-# ─── Pull results ───────────────────────────────────────────────────────
-pull_results() {
-    local cs
-    cs=$(get_codespace)
-    [ -z "$cs" ] && { err "No codespace available"; exit 1; }
+# ─── Auth instructions ───────────────────────────────────────────────────
+do_auth() {
+    header ""
+    header "════════════════════════════════════════════════════════"
+    header "  🔐 Max Plan Authentication"
+    header "════════════════════════════════════════════════════════"
+    echo ""
+    echo "  1. Open your codespace in the browser:"
+    echo ""
+    echo "     gh codespace code --web"
+    echo ""
+    echo "  2. In the VS Code terminal (Ctrl+\`), run:"
+    echo ""
+    echo "     claude"
+    echo ""
+    echo "  3. Select 'Claude account with subscription'"
+    echo "  4. Follow the OAuth link and paste the code back"
+    echo "  5. Exit Claude (Ctrl+C)"
+    echo ""
+    echo "  6. Restart the API server to pick up credentials:"
+    echo "     In the codespace terminal, run:"
+    echo ""
+    echo "     kill \$(cat .server.pid) 2>/dev/null; node server.js &"
+    echo ""
+    echo "  Your credentials will persist across rebuilds."
+    echo ""
+    header "════════════════════════════════════════════════════════"
 
-    local wd
-    wd=$(get_workdir "$cs")
-
-    local dest="./codespace-results"
-    mkdir -p "$dest"
-
-    info "Downloading results from $wd/results/..."
-    gh codespace cp -c "$cs" -r "remote:${wd}/results/" "$dest/"
-    ok "Results downloaded to $dest"
+    echo ""
+    read -rp "Open codespace in browser now? [Y/n] " yn
+    if [ "$yn" != "n" ] && [ "$yn" != "N" ]; then
+        gh codespace code --web
+    fi
 }
 
 # ─── Main ────────────────────────────────────────────────────────────────
@@ -234,41 +233,33 @@ case "${1:-}" in
     --auth|-a)
         do_auth
         ;;
-    --check|-c)
-        check_auth
+    --health|-h)
+        do_health
         ;;
-    --list-results|-l)
-        list_results
+    --list|-l)
+        list_tasks
         ;;
-    --fetch|-f)
-        fetch_result "$2"
+    --get|-g)
+        get_task "$2"
         ;;
-    --interactive|-i)
-        open_interactive
+    --forward|-f)
+        do_forward
         ;;
-    --pull|-p)
-        pull_results
-        ;;
-    --help|-h)
+    --help)
         echo ""
-        header "Claude Code Codespace Task Submitter (Max Plan)"
+        header "Claude Code Task Submitter (Max Plan — HTTP API)"
         echo ""
-        echo "First-time setup:"
-        echo "  $0 --auth                   Log in with your Max plan"
-        echo "  $0 --check                  Verify auth status"
+        echo "Setup:"
+        echo "  $0 --auth                     Authenticate with Max plan"
+        echo "  $0 --forward                  Forward port from codespace"
+        echo "  $0 --health                   Check API + auth status"
         echo ""
-        echo "Submit tasks:"
-        echo "  $0 'task description'        Submit task (async)"
-        echo "  $0 'task' --wait             Submit and wait for result"
-        echo ""
-        echo "Manage results:"
-        echo "  $0 --list-results            List completed tasks"
-        echo "  $0 --fetch <task-id>         Fetch a specific result"
-        echo "  $0 --pull                    Download all results locally"
-        echo ""
-        echo "Other:"
-        echo "  $0 --interactive             Open interactive Claude session"
-        echo "  $0 --help                    Show this help"
+        echo "Tasks:"
+        echo "  $0 'task description'          Submit task (async)"
+        echo "  $0 'task' --wait               Submit and wait for result"
+        echo "  $0 'task' claude-opus-4-6      Submit with specific model"
+        echo "  $0 --list                      List all tasks"
+        echo "  $0 --get <task-id>             Get task result"
         echo ""
         ;;
     "")
@@ -276,6 +267,6 @@ case "${1:-}" in
         exit 1
         ;;
     *)
-        submit_task "$1" "$2"
+        submit_task "$1" "$2" "$3"
         ;;
 esac
