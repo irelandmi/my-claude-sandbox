@@ -7,18 +7,28 @@
 # Prerequisites:
 #   - gh cli installed and authenticated
 #   - A codespace running with Claude Code installed
-#
-# Usage:
-#   ./submit-task.sh --auth                          First-time login
-#   ./submit-task.sh 'Write a REST API'              Submit async task
-#   ./submit-task.sh 'Write a REST API' --wait       Submit and wait
-#   ./submit-task.sh --list-results                  List completed tasks
-#   ./submit-task.sh --interactive                   Open interactive session
 
 set -e
 
-# ─── Configuration ───────────────────────────────────────────────────────
 CODESPACE_NAME=""  # Leave empty to auto-detect
+
+# ─── Helper to resolve workspace dir inside the codespace ────────────────
+# Codespaces use /workspaces/<repo-name>, not /workspace
+# setup.sh saves the path to ~/.sandbox-workdir
+RESOLVE_WORKDIR='
+WORKDIR="";
+if [ -f "$HOME/.sandbox-workdir" ]; then
+    WORKDIR="$(cat "$HOME/.sandbox-workdir")";
+else
+    WORKDIR="$(find /workspaces -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)";
+fi;
+if [ -z "$WORKDIR" ] || [ ! -d "$WORKDIR" ]; then
+    echo "❌ Could not find workspace directory." >&2;
+    echo "   Is the codespace set up? Try: gh codespace ssh" >&2;
+    exit 1;
+fi;
+cd "$WORKDIR"
+'
 
 # ─── Colours ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -56,7 +66,7 @@ get_codespace() {
                 --devcontainer-path .devcontainer/devcontainer.json \
                 --json -q '.name')
             ok "Created codespace: $cs"
-            info "Waiting for setup to complete (this may take a minute)..."
+            info "Waiting for setup to complete..."
             sleep 30
         fi
     fi
@@ -64,7 +74,7 @@ get_codespace() {
     echo "$cs"
 }
 
-# ─── Auth: interactive login for Max plan ────────────────────────────────
+# ─── Auth ────────────────────────────────────────────────────────────────
 do_auth() {
     local cs
     cs=$(get_codespace)
@@ -88,19 +98,18 @@ do_auth() {
     echo ""
     read -rp "Press Enter to continue..." _
 
-    gh codespace ssh -c "$cs" -- "cd /workspace && claude"
+    # SSH in, resolve the workdir, then launch claude
+    gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; claude"
 
     # Trigger credential backup
-    gh codespace ssh -c "$cs" -- "bash .devcontainer/save-creds.sh" 2>/dev/null || true
+    gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; bash .devcontainer/save-creds.sh" 2>/dev/null || true
 
     echo ""
     ok "Authentication complete! Credentials saved."
-    echo ""
-    info "You can now submit tasks with:"
-    echo "  $0 'your task description'"
+    info "You can now submit tasks with: $0 'your task description'"
 }
 
-# ─── Check auth status ──────────────────────────────────────────────────
+# ─── Check auth ──────────────────────────────────────────────────────────
 check_auth() {
     local cs
     cs=$(get_codespace)
@@ -108,24 +117,26 @@ check_auth() {
 
     info "Checking authentication status..."
 
-    gh codespace ssh -c "$cs" -- '
+    gh codespace ssh -c "$cs" -- bash -c '
         echo ""
         if [ -f "$HOME/.claude/.credentials.json" ]; then
             echo "✅ OAuth credentials found at ~/.claude/.credentials.json"
         else
             echo "❌ No credentials at ~/.claude/.credentials.json"
         fi
-
         if [ -f "$HOME/.claude-persist/.credentials.json" ]; then
             echo "✅ Persistent backup exists (survives rebuilds)"
         else
             echo "⚠️  No persistent backup yet"
         fi
-
         if [ -f "$HOME/.config/claude-code/auth.json" ]; then
             echo "✅ Auth token at ~/.config/claude-code/auth.json"
         fi
-
+        if [ -f "$HOME/.sandbox-workdir" ]; then
+            echo "📁 Workspace: $(cat "$HOME/.sandbox-workdir")"
+        else
+            echo "⚠️  Workspace path not saved (setup may not have completed)"
+        fi
         echo ""
     '
 }
@@ -144,12 +155,13 @@ submit_task() {
     echo "📋 Task: $task"
     echo ""
 
+    # Escape single quotes in the task for safe shell passing
+    local escaped_task="${task//\'/\'\\\'\'}"
+
     if [ "$wait_flag" = "--wait" ]; then
-        gh codespace ssh -c "$cs" -- \
-            "cd /workspace && bash task-runner.sh '$task'"
+        gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; bash task-runner.sh '$escaped_task'"
     else
-        gh codespace ssh -c "$cs" -- \
-            "cd /workspace && nohup bash task-runner.sh '$task' > /dev/null 2>&1 &"
+        gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; nohup bash task-runner.sh '$escaped_task' > /dev/null 2>&1 &"
         ok "Task submitted in background."
         info "Check results with: $0 --list-results"
     fi
@@ -164,17 +176,18 @@ list_results() {
     info "Results from codespace: $cs"
     echo ""
 
-    gh codespace ssh -c "$cs" -- '
-        for dir in /workspace/results/task-*/; do
-            [ -d "$dir" ] || continue
-            meta="$dir/task-meta.json"
-            if [ -f "$meta" ]; then
-                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                jq -r "\"📋 \(.task_id) [\(.status)]\" + \"\n   Task: \(.task)\" + \"\n   Duration: \(.duration_seconds // \"running\")s\"" "$meta" 2>/dev/null
+    gh codespace ssh -c "$cs" -- bash -c "
+        $RESOLVE_WORKDIR
+        for dir in \"\$WORKDIR\"/results/task-*/; do
+            [ -d \"\$dir\" ] || continue
+            meta=\"\$dir/task-meta.json\"
+            if [ -f \"\$meta\" ]; then
+                echo \"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\"
+                jq -r '\"📋 \(.task_id) [\(.status)]\" + \"\n   Task: \(.task)\" + \"\n   Duration: \(.duration_seconds // \"running\")s\"' \"\$meta\" 2>/dev/null
             fi
         done
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    '
+        echo \"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\"
+    "
 }
 
 # ─── Fetch specific result ───────────────────────────────────────────────
@@ -186,30 +199,34 @@ fetch_result() {
 
     info "Fetching result for: $task_id"
     echo ""
-    gh codespace ssh -c "$cs" -- "cat /workspace/results/$task_id/response.txt 2>/dev/null || echo 'Result not found'"
+    gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; cat results/$task_id/response.txt 2>/dev/null || echo 'Result not found'"
 }
 
-# ─── Interactive session ─────────────────────────────────────────────────
+# ─── Interactive ─────────────────────────────────────────────────────────
 open_interactive() {
     local cs
     cs=$(get_codespace)
     [ -z "$cs" ] && { err "No codespace available"; exit 1; }
 
     info "Opening interactive Claude Code session..."
-    gh codespace ssh -c "$cs" -- "cd /workspace && claude"
+    gh codespace ssh -c "$cs" -- bash -c "$RESOLVE_WORKDIR; claude"
 }
 
-# ─── Pull results locally ───────────────────────────────────────────────
+# ─── Pull results ───────────────────────────────────────────────────────
 pull_results() {
     local cs
     cs=$(get_codespace)
     [ -z "$cs" ] && { err "No codespace available"; exit 1; }
 
+    # Get the remote workspace path
+    local remote_workdir
+    remote_workdir=$(gh codespace ssh -c "$cs" -- bash -c 'cat "$HOME/.sandbox-workdir" 2>/dev/null || find /workspaces -maxdepth 1 -mindepth 1 -type d | head -1')
+
     local dest="./codespace-results"
     mkdir -p "$dest"
 
-    info "Downloading results to $dest..."
-    gh codespace cp -c "$cs" -r "remote:/workspace/results/" "$dest/"
+    info "Downloading results from $remote_workdir/results/..."
+    gh codespace cp -c "$cs" -r "remote:${remote_workdir}/results/" "$dest/"
     ok "Results downloaded to $dest"
 }
 
